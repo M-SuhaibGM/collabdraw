@@ -2,9 +2,16 @@
 const { Server } = require("socket.io");
 const http = require("http");
 
+// server.js
+const PORT = process.env.PORT || 3001; // Render provides the port
+
 const server = http.createServer();
 const io = new Server(server, {
-  cors: { origin: "http://localhost:3000", methods: ["GET", "POST"] }
+  cors: {
+    // Replace with your actual Vercel URL once you have it
+    origin: ["http://localhost:3000", "https://Colabdraw.vercel.app"],
+    methods: ["GET", "POST"]
+  }
 });
 
 const boardStates = {};
@@ -49,4 +56,6 @@ io.on("connection", (socket) => {
   socket.on("disconnect", () => console.log("Disconnected:", socket.id));
 });
 
-server.listen(3001, () => console.log("🚀 Server on port 3001"));
+server.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
