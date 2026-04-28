@@ -3,32 +3,51 @@ import { useEffect, useRef, useState } from "react";
 import BoardToolbar from "@/app/components/BoardToolbar";
 import { io } from "socket.io-client";
 
-// ── Module-level singletons ──────────────────────────────────────────────────
-let _socket  = null;
-let _canvas  = null;
-let _boardId = null;
-let _isRemote = false;
-let _saveTimer = null;
+let _socket      = null;
+let _canvas      = null;
+let _fabric      = null;
+let _boardId     = null;
+let _saveTimer   = null;
+let _syncedCount = 0;
+let _remoteAdd   = false;
 
 function getSocket() {
   if (!_socket) {
     _socket = io("http://localhost:3001", { transports: ["websocket"] });
-    _socket.on("connect",    () => console.log("[socket] connected ✓", _socket.id));
+    _socket.on("connect",    () => console.log("[socket] ✓", _socket.id));
     _socket.on("disconnect", (r) => console.warn("[socket] disconnected:", r));
   }
   return _socket;
 }
 
-function doSyncAndSave() {
-  // Skip if we're applying a remote update — prevents echo loop
-  if (_isRemote || !_canvas || !_boardId) return;
+function emitNewObjects() {
+  if (_remoteAdd || !_canvas || !_boardId) return;
+  const fullJson = _canvas.toJSON();
+  const all = fullJson.objects ?? [];
+  const newObjs = all.slice(_syncedCount);
+  if (newObjs.length === 0) return;
+  _syncedCount = all.length;
+  newObjs.forEach(obj => {
+    console.log("[emit] add-object type:", obj.type);
+    getSocket().emit("add-object", { id: _boardId, obj });
+  });
+  scheduleSave(fullJson);
+}
 
-  const canvasData = _canvas.toJSON();
-  console.log("[sync] emitting, objects:", canvasData.objects?.length ?? 0);
-  getSocket().emit("draw", { id: _boardId, canvasData });
+// Emit all objects with their current positions (for move/resize)
+function emitFullObjects() {
+  if (_remoteAdd || !_canvas || !_boardId) return;
+  const fullJson = _canvas.toJSON();
+  console.log("[emit] update-all, objects:", fullJson.objects?.length);
+  getSocket().emit("update-all", { id: _boardId, objects: fullJson.objects ?? [] });
+  scheduleSave(fullJson);
+}
 
+function scheduleSave(data) {
   clearTimeout(_saveTimer);
   _saveTimer = setTimeout(async () => {
+    const canvasData = data ?? _canvas?.toJSON();
+    if (!canvasData || !_boardId) return;
     try {
       const res = await fetch(`/api/boards/${_boardId}`, {
         method: "PUT",
@@ -36,40 +55,104 @@ function doSyncAndSave() {
         body: JSON.stringify({ data: canvasData }),
       });
       const j = await res.json();
-      console.log("[save]", res.ok ? "✓" : "✗", j);
-    } catch (e) {
-      console.error("[save] error:", e);
-    }
-  }, 1000);
+      console.log("[save] ✓", j.updatedAt);
+    } catch (e) { console.error("[save] error:", e); }
+  }, 1500);
 }
 
-function doApplyJSON(json) {
-  if (!_canvas) return;
-  _isRemote = true;
-
-  const safetyReset = setTimeout(() => {
-    if (_isRemote) { _isRemote = false; console.warn("[remote] safety reset"); }
-  }, 3000);
-
+async function addRemoteObject(objData) {
+  if (!_canvas || !_fabric || !objData?.type) return;
+  const fabric = _fabric;
+  const type = objData.type.toLowerCase();
+  const map = {
+    path: fabric.Path, rect: fabric.Rect, circle: fabric.Circle,
+    ellipse: fabric.Ellipse, triangle: fabric.Triangle,
+    line: fabric.Line, image: fabric.Image,
+    textbox: fabric.Textbox, text: fabric.Text, polygon: fabric.Polygon,
+  };
+  const Klass = map[type];
+  if (!Klass) { console.error("[remote] no class for:", type); return; }
   try {
-    _canvas.loadFromJSON(json, () => {
-      _canvas.renderAll();
-      clearTimeout(safetyReset);
-      // Use setTimeout so all the object:added events that loadFromJSON
-      // fires synchronously have already been processed before we unblock
-      setTimeout(() => {
-        _isRemote = false;
-        console.log("[remote] applied ✓, _isRemote = false");
-      }, 50);
-    });
+    const obj = await Klass.fromObject(objData);
+    _remoteAdd = true;
+    _canvas.add(obj);
+    _canvas.renderAll();
+    _syncedCount = (_canvas.toJSON().objects ?? []).length;
+    console.log("[remote] added", type, "total:", _syncedCount);
   } catch (e) {
-    console.error("[remote] error:", e);
-    clearTimeout(safetyReset);
-    _isRemote = false;
+    console.error("[remote] addRemoteObject error:", e.message);
+  } finally {
+    _remoteAdd = false;
   }
 }
 
-// ── Component ────────────────────────────────────────────────────────────────
+// Update existing objects in-place by matching index — no canvas wipe
+async function updateAllObjects(objects) {
+  if (!_canvas || !_fabric || !objects) return;
+  const fabric = _fabric;
+  const map = {
+    path: fabric.Path, rect: fabric.Rect, circle: fabric.Circle,
+    ellipse: fabric.Ellipse, triangle: fabric.Triangle,
+    line: fabric.Line, image: fabric.Image,
+    textbox: fabric.Textbox, text: fabric.Text, polygon: fabric.Polygon,
+  };
+
+  _remoteAdd = true;
+  try {
+    const existing = _canvas.getObjects();
+
+    if (existing.length !== objects.length) {
+      // Object count changed — need full reload (rare case)
+      _canvas.loadFromJSON({ version: _fabric.version, objects }, () => {
+        _canvas.renderAll();
+        _syncedCount = objects.length;
+        _remoteAdd = false;
+      });
+      return;
+    }
+
+    // Same count — update each object's properties in-place
+    // This avoids any canvas wipe
+    await Promise.all(existing.map(async (fabricObj, i) => {
+      const data = objects[i];
+      if (!data) return;
+      // Set all numeric/string properties directly
+      fabricObj.set({
+        left:    data.left,
+        top:     data.top,
+        scaleX:  data.scaleX,
+        scaleY:  data.scaleY,
+        angle:   data.angle,
+        flipX:   data.flipX,
+        flipY:   data.flipY,
+        opacity: data.opacity,
+        fill:    data.fill,
+        stroke:  data.stroke,
+      });
+      fabricObj.setCoords();
+    }));
+
+    _canvas.renderAll();
+    console.log("[remote] updated", existing.length, "objects in-place ✓");
+  } catch (e) {
+    console.error("[remote] updateAllObjects error:", e);
+  } finally {
+    _remoteAdd = false;
+  }
+}
+
+// Only used for initial page load — canvas is empty so wipe is fine
+function applyInitialState(canvasData) {
+  if (!_canvas) return;
+  _remoteAdd = true;
+  _canvas.loadFromJSON(canvasData, () => {
+    _canvas.renderAll();
+    _syncedCount = canvasData.objects?.length ?? 0;
+    _remoteAdd = false;
+    console.log("[init] loaded, objects:", _syncedCount);
+  });
+}
+
 export default function BoardClient({ id: boardId }) {
   const containerRef = useRef(null);
   const canvasElRef  = useRef(null);
@@ -79,13 +162,17 @@ export default function BoardClient({ id: boardId }) {
   const [color, setColor]           = useState("#4f46e5");
 
   useEffect(() => {
-    _boardId = boardId;
+    _boardId     = boardId;
+    _syncedCount = 0;
+    _remoteAdd   = false;
+
     const container = containerRef.current;
     const el        = canvasElRef.current;
     if (!container || !el || _canvas) return;
 
     import("fabric").then((mod) => {
-      const fabric = mod.default ?? mod;
+      _fabric = mod.default ?? mod;
+      const fabric = _fabric;
 
       _canvas = new fabric.Canvas(el, {
         backgroundColor: "white",
@@ -99,17 +186,21 @@ export default function BoardClient({ id: boardId }) {
       brush.color = "#4f46e5";
       _canvas.freeDrawingBrush = brush;
 
-      // path:created is the correct event for freehand drawing —
-      // it fires ONCE after the stroke is complete.
-      // object:added fires for programmatic additions (shapes).
-      // We do NOT use object:added for drawing because loadFromJSON
-      // fires object:added for every deserialized object, and even
-      // though _isRemote guards it, using path:created is cleaner.
-      _canvas.on("path:created",    doSyncAndSave);
-      _canvas.on("object:modified", doSyncAndSave);
-      // Only sync object:added for non-path objects (shapes/images)
+      _canvas.on("path:created", () => {
+        if (_remoteAdd) return;
+        emitNewObjects();
+      });
+
       _canvas.on("object:added", (e) => {
-        if (e.target?.type !== "path") doSyncAndSave();
+        if (_remoteAdd) return;
+        if (e.target?.type === "path") return;
+        emitNewObjects();
+      });
+
+      // FIX: emit positions only, receiver updates in-place (no wipe)
+      _canvas.on("object:modified", () => {
+        if (_remoteAdd) return;
+        emitFullObjects();
       });
 
       const ro = new ResizeObserver(() => {
@@ -118,23 +209,37 @@ export default function BoardClient({ id: boardId }) {
       });
       ro.observe(container);
 
-      // Socket
       const socket = getSocket();
       socket.emit("join-board", boardId);
-      socket.on("connect",       () => socket.emit("join-board", boardId));
-      socket.on("canvas-update", (data) => {
-        console.log("[socket] canvas-update from other client ✓");
-        doApplyJSON(data);
-      });
-      socket.on("clear-canvas",  () => {
-        _isRemote = true;
-        _canvas?.clear();
-        if (_canvas) _canvas.backgroundColor = "white";
-        _canvas?.renderAll();
-        _isRemote = false;
+      socket.on("connect", () => socket.emit("join-board", boardId));
+
+      socket.on("add-object", (objData) => {
+        console.log("[socket] add-object type:", objData?.type);
+        addRemoteObject(objData);
       });
 
-      // Load saved data
+      // Receive position updates — update in-place, no wipe
+      socket.on("update-all", (objects) => {
+        console.log("[socket] update-all, count:", objects?.length);
+        updateAllObjects(objects);
+      });
+
+      // Full state only for new joiners
+      socket.on("full-state", (canvasData) => {
+        console.log("[socket] full-state (new joiner), objects:", canvasData?.objects?.length);
+        applyInitialState(canvasData);
+      });
+
+      socket.on("clear-canvas", () => {
+        if (!_canvas) return;
+        _remoteAdd = true;
+        _canvas.clear();
+        _canvas.backgroundColor = "white";
+        _canvas.renderAll();
+        _syncedCount = 0;
+        _remoteAdd = false;
+      });
+
       fetch(`/api/boards/${boardId}`)
         .then(r => r.json())
         .then(board => {
@@ -142,21 +247,23 @@ export default function BoardClient({ id: boardId }) {
           if (board.data) {
             const json = typeof board.data === "string"
               ? JSON.parse(board.data) : board.data;
-            doApplyJSON(json);
-          } else {
-            _isRemote = false;
+            applyInitialState(json);
           }
         })
-        .catch(e => { console.error("[board] fetch error:", e); _isRemote = false; });
+        .catch(e => console.error("[board] fetch error:", e));
 
     }).catch(e => console.error("[fabric] import failed:", e));
 
     return () => {
-      getSocket().off("canvas-update");
-      getSocket().off("clear-canvas");
+      const s = getSocket();
+      s.off("add-object");
+      s.off("update-all");
+      s.off("full-state");
+      s.off("clear-canvas");
       clearTimeout(_saveTimer);
       if (_canvas) { _canvas.dispose(); _canvas = null; }
-      _isRemote = false;
+      _syncedCount = 0;
+      _remoteAdd   = false;
     };
   }, [boardId]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -204,11 +311,14 @@ export default function BoardClient({ id: boardId }) {
 
   const clearBoard = () => {
     if (!_canvas) return;
+    _remoteAdd = true;
     _canvas.clear();
     _canvas.backgroundColor = "white";
     _canvas.renderAll();
+    _syncedCount = 0;
+    _remoteAdd = false;
     getSocket().emit("clear-board", boardId);
-    doSyncAndSave();
+    scheduleSave({ version: "6.0.0", objects: [] });
   };
 
   const handleExport = () => {
