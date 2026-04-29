@@ -9,7 +9,7 @@ const server = http.createServer();
 const io = new Server(server, {
   cors: {
     // Replace with your actual Vercel URL once you have it
-    origin: ["http://localhost:3000", "https://Colabdraw.vercel.app"],
+    origin: ["http://localhost:3000", "https://collabdraw-seven.vercel.app"],
     methods: ["GET", "POST"]
   }
 });
