@@ -44,7 +44,7 @@ export default function Dashboard() {
             });
             if (response.ok) {
                 const board = await response.json();
-                router.push(`/board/${board.id}`);
+                router.push(`/boards/${board.id}`);
             }
         } catch (error) {
             console.error("Failed to create board:", error);
