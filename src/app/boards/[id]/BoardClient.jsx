@@ -3,22 +3,44 @@ import { useEffect, useRef, useState } from "react";
 import BoardToolbar from "@/app/components/BoardToolbar";
 import { io } from "socket.io-client";
 
-let _socket      = null;
-let _canvas      = null;
-let _fabric      = null;
-let _boardId     = null;
-let _saveTimer   = null;
+let _socket = null;
+let _canvas = null;
+let _fabric = null;
+let _boardId = null;
+let _saveTimer = null;
 let _syncedCount = 0;
-let _remoteAdd   = false;
+let _remoteAdd = false;
 
 function getSocket() {
+
   if (!_socket) {
-    _socket = io("http://localhost:3001", { transports: ["websocket"] });
-    _socket.on("connect",    () => console.log("[socket] ✓", _socket.id));
-    _socket.on("disconnect", (r) => console.warn("[socket] disconnected:", r));
+    // Falls back to localhost if the environment variable isn't set
+    const endpoint = process.env.NEXT_PUBLIC_SOCKET_URL || "http://localhost:3001";
+
+    console.log("[socket] Connecting to:", endpoint);
+
+    _socket = io(endpoint, {
+      transports: ["websocket"],
+      // Add reconnection logic for better stability
+      reconnectionAttempts: 5,
+      reconnectionDelay: 1000,
+    });
+
+    _socket.on("connect", () => {
+      console.log("[socket] Connected ✓ ID:", _socket.id);
+    });
+
+    _socket.on("connect_error", (err) => {
+      console.error("[socket] Connection Error:", err.message);
+    });
+
+    _socket.on("disconnect", (reason) => {
+      console.warn("[socket] Disconnected:", reason);
+    });
   }
   return _socket;
-}
+};
+
 
 function emitNewObjects() {
   if (_remoteAdd || !_canvas || !_boardId) return;
@@ -118,16 +140,16 @@ async function updateAllObjects(objects) {
       if (!data) return;
       // Set all numeric/string properties directly
       fabricObj.set({
-        left:    data.left,
-        top:     data.top,
-        scaleX:  data.scaleX,
-        scaleY:  data.scaleY,
-        angle:   data.angle,
-        flipX:   data.flipX,
-        flipY:   data.flipY,
+        left: data.left,
+        top: data.top,
+        scaleX: data.scaleX,
+        scaleY: data.scaleY,
+        angle: data.angle,
+        flipX: data.flipX,
+        flipY: data.flipY,
         opacity: data.opacity,
-        fill:    data.fill,
-        stroke:  data.stroke,
+        fill: data.fill,
+        stroke: data.stroke,
       });
       fabricObj.setCoords();
     }));
@@ -155,19 +177,19 @@ function applyInitialState(canvasData) {
 
 export default function BoardClient({ id: boardId }) {
   const containerRef = useRef(null);
-  const canvasElRef  = useRef(null);
+  const canvasElRef = useRef(null);
 
   const [boardTitle, setBoardTitle] = useState("Loading...");
   const [activeTool, setActiveTool] = useState("pencil");
-  const [color, setColor]           = useState("#4f46e5");
+  const [color, setColor] = useState("#4f46e5");
 
   useEffect(() => {
-    _boardId     = boardId;
+    _boardId = boardId;
     _syncedCount = 0;
-    _remoteAdd   = false;
+    _remoteAdd = false;
 
     const container = containerRef.current;
-    const el        = canvasElRef.current;
+    const el = canvasElRef.current;
     if (!container || !el || _canvas) return;
 
     import("fabric").then((mod) => {
@@ -177,7 +199,7 @@ export default function BoardClient({ id: boardId }) {
       _canvas = new fabric.Canvas(el, {
         backgroundColor: "white",
         isDrawingMode: true,
-        width:  container.clientWidth,
+        width: container.clientWidth,
         height: container.clientHeight,
       });
 
@@ -263,7 +285,7 @@ export default function BoardClient({ id: boardId }) {
       clearTimeout(_saveTimer);
       if (_canvas) { _canvas.dispose(); _canvas = null; }
       _syncedCount = 0;
-      _remoteAdd   = false;
+      _remoteAdd = false;
     };
   }, [boardId]); // eslint-disable-line react-hooks/exhaustive-deps
 
